@@ -40,7 +40,7 @@
     input, textarea, button {
       font: inherit;
     }
-    input[type="file"], textarea {
+    input[type="file"], input[type="text"], input[type="password"], textarea {
       width: 100%;
       border: 1px solid #cdd5df;
       border-radius: 6px;
@@ -201,8 +201,27 @@
         <input id="upload" type="file" accept="image/png,image/jpeg,image/webp" multiple />
       </label>
 
+      <label>
+        API Base URL
+        <input id="apiUrl" type="text" placeholder="http://relay:8080/v1 or https://api.openai.com/v1" />
+      </label>
+      <label>
+        API Key
+        <input id="apiKey" type="password" placeholder="optional for local relay" />
+      </label>
+      <label>
+        Model
+        <input id="model" type="text" placeholder="gpt-4.1-mini" />
+      </label>
+      <label>
+        Target
+        <input id="targetLanguage" type="text" value="Simplified Chinese" />
+      </label>
+
       <div class="actions">
         <button id="addBox" disabled>Add Box</button>
+        <button id="autoPage" class="secondary" disabled>Auto Page</button>
+        <button id="autoAll" class="secondary" disabled>Auto All</button>
         <button id="saveState" class="secondary" disabled>Save</button>
         <button id="render" class="secondary" disabled>Preview</button>
         <button id="download" class="secondary" disabled>ZIP</button>
@@ -246,7 +265,13 @@
 
     const els = {
       upload: document.getElementById("upload"),
+      apiUrl: document.getElementById("apiUrl"),
+      apiKey: document.getElementById("apiKey"),
+      model: document.getElementById("model"),
+      targetLanguage: document.getElementById("targetLanguage"),
       addBox: document.getElementById("addBox"),
+      autoPage: document.getElementById("autoPage"),
+      autoAll: document.getElementById("autoAll"),
       saveState: document.getElementById("saveState"),
       render: document.getElementById("render"),
       download: document.getElementById("download"),
@@ -280,8 +305,33 @@
     }
 
     function enableControls(enabled) {
-      for (const el of [els.addBox, els.saveState, els.render, els.download]) el.disabled = !enabled;
+      for (const el of [els.addBox, els.autoPage, els.autoAll, els.saveState, els.render, els.download]) el.disabled = !enabled;
       updateEditor();
+    }
+
+    function setBusy(busy) {
+      for (const el of [els.upload, els.addBox, els.autoPage, els.autoAll, els.saveState, els.render, els.download]) {
+        el.disabled = busy || (!state.projectId && el !== els.upload);
+      }
+    }
+
+    function loadApiSettings() {
+      const saved = JSON.parse(localStorage.getItem("ctWebApiSettings") || "{}");
+      els.apiUrl.value = saved.apiUrl || "";
+      els.apiKey.value = saved.apiKey || "";
+      els.model.value = saved.model || "gpt-4.1-mini";
+      els.targetLanguage.value = saved.targetLanguage || "Simplified Chinese";
+    }
+
+    function apiSettings() {
+      const settings = {
+        apiUrl: els.apiUrl.value.trim(),
+        apiKey: els.apiKey.value.trim(),
+        model: els.model.value.trim(),
+        targetLanguage: els.targetLanguage.value.trim() || "Simplified Chinese",
+      };
+      localStorage.setItem("ctWebApiSettings", JSON.stringify(settings));
+      return settings;
     }
 
     function updateEditor() {
@@ -415,6 +465,55 @@
       if (!options.silent) setMessage("Saved.");
     }
 
+    async function autoTranslateCurrentPage(options = {}) {
+      if (!state.projectId || !state.currentPageId) return;
+      const settings = apiSettings();
+      if (!settings.apiUrl || !settings.model) {
+        throw new Error("API Base URL and Model are required");
+      }
+      if (!options.silent) setMessage("Auto translating current page...");
+      const response = await fetch(`/api/projects/${state.projectId}/pages/${state.currentPageId}/auto-translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_url: settings.apiUrl,
+          api_key: settings.apiKey,
+          model: settings.model,
+          target_language: settings.targetLanguage,
+          source_language: "auto",
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      state.boxes = data.state.boxes || [];
+      const page = currentPage();
+      if (page) page.state = data.state;
+      state.selectedId = state.boxes[0]?.id || "";
+      renderPages();
+      renderBoxes();
+      if (!options.silent) setMessage(`Auto translated ${state.boxes.length} box(es).`);
+    }
+
+    async function autoTranslateAllPages() {
+      if (!state.pages.length) return;
+      const originalPageId = state.currentPageId;
+      setBusy(true);
+      try {
+        for (let index = 0; index < state.pages.length; index += 1) {
+          const page = state.pages[index];
+          loadPage(page.id);
+          setBusy(true);
+          setMessage(`Auto translating page ${index + 1}/${state.pages.length}...`);
+          await autoTranslateCurrentPage({ silent: true });
+        }
+        loadPage(originalPageId || state.pages[0].id);
+        setMessage(`Auto translated ${state.pages.length} page(s).`);
+      } finally {
+        setBusy(false);
+        enableControls(Boolean(state.projectId));
+      }
+    }
+
     async function uploadImages(files) {
       const form = new FormData();
       for (const file of files) form.append("images", file);
@@ -449,6 +548,18 @@
     });
 
     els.addBox.addEventListener("click", addLocalBox);
+    els.autoPage.addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        await autoTranslateCurrentPage();
+      } catch (error) {
+        setMessage(`Auto failed: ${error.message}`);
+      } finally {
+        setBusy(false);
+        enableControls(Boolean(state.projectId));
+      }
+    });
+    els.autoAll.addEventListener("click", () => autoTranslateAllPages().catch((error) => setMessage(`Auto all failed: ${error.message}`)));
     els.saveState.addEventListener("click", () => saveState().catch((error) => setMessage(`Save failed: ${error.message}`)));
     els.render.addEventListener("click", async () => {
       await saveState();
@@ -521,6 +632,8 @@
     window.addEventListener("pointerup", () => {
       state.drag = null;
     });
+
+    loadApiSettings();
   </script>
 </body>
 </html>

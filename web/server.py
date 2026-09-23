@@ -1,11 +1,14 @@
 import io
 import json
 import os
+import re
 import secrets
 import zipfile
+import base64
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +40,15 @@ class Box(BaseModel):
 
 class ProjectState(BaseModel):
     boxes: list[Box] = Field(default_factory=list)
+
+
+class AutoTranslateRequest(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    target_language: str = "Simplified Chinese"
+    source_language: str = "auto"
+    extra_context: str = ""
 
 
 class PageInfo(BaseModel):
@@ -173,6 +185,141 @@ def render_page(path: Path) -> bytes:
     return buf.getvalue()
 
 
+def chat_completions_url(api_url: str) -> str:
+    base = (api_url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(400, detail="API URL is required")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", value, flags=re.S)
+        if not match:
+            raise HTTPException(502, detail=f"Model did not return JSON: {text[:500]}")
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(502, detail=f"Could not parse model JSON: {exc}") from exc
+
+
+def normalize_model_boxes(payload: dict[str, Any], width: int, height: int) -> list[Box]:
+    boxes: list[Box] = []
+    raw_boxes = payload.get("boxes")
+    if not isinstance(raw_boxes, list):
+        raise HTTPException(502, detail="Model JSON must contain a boxes array")
+    for raw in raw_boxes:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            x = float(raw.get("x", 0))
+            y = float(raw.get("y", 0))
+            box_width = float(raw.get("width", raw.get("w", 0)))
+            box_height = float(raw.get("height", raw.get("h", 0)))
+        except (TypeError, ValueError):
+            continue
+        if box_width <= 1 or box_height <= 1:
+            continue
+        x = max(0, min(x, width - 1))
+        y = max(0, min(y, height - 1))
+        box_width = max(2, min(box_width, width - x))
+        box_height = max(2, min(box_height, height - y))
+        boxes.append(
+            Box(
+                x=x,
+                y=y,
+                width=box_width,
+                height=box_height,
+                text=str(raw.get("text", "") or ""),
+                translation=str(raw.get("translation", "") or ""),
+            )
+        )
+    return boxes
+
+
+async def call_chat_completions(
+    request: AutoTranslateRequest,
+    image_bytes: bytes,
+    image_width: int,
+    image_height: int,
+    *,
+    stream: bool = False,
+) -> str:
+    if not request.model.strip():
+        raise HTTPException(400, detail="Model is required")
+    image_data = base64.b64encode(image_bytes).decode("ascii")
+    system_prompt = (
+        "You are a comic translation assistant. Detect every visible speech bubble, caption, sign, "
+        "or sound-effect text region that should be translated. OCR the source text and translate it. "
+        "Return only valid JSON."
+    )
+    user_prompt = (
+        f"Image size is {image_width}x{image_height}. Source language: {request.source_language or 'auto'}. "
+        f"Target language: {request.target_language or 'Simplified Chinese'}.\n"
+        "Return this exact JSON shape: "
+        '{"boxes":[{"x":0,"y":0,"width":100,"height":40,"text":"source text","translation":"translated text"}]}.\n'
+        "Coordinates must be pixel coordinates in the original image. Merge text lines that belong to the same bubble. "
+        "Skip decorative art without readable text. Do not include markdown."
+    )
+    if request.extra_context.strip():
+        user_prompt += f"\nExtra translation context: {request.extra_context.strip()}"
+
+    headers = {"Content-Type": "application/json"}
+    if request.api_key.strip():
+        headers["Authorization"] = f"Bearer {request.api_key.strip()}"
+    body: dict[str, Any] = {
+        "model": request.model.strip(),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                ],
+            },
+        ],
+        "temperature": 0,
+        "stream": stream,
+    }
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(chat_completions_url(request.api_url), headers=headers, json=body)
+    if response.status_code >= 400:
+        raise HTTPException(response.status_code, detail=response.text)
+    if not stream:
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+    chunks: list[str] = []
+    for line in response.text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        if not data:
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        delta = event.get("choices", [{}])[0].get("delta", {})
+        if "content" in delta:
+            chunks.append(delta["content"])
+    return "".join(chunks)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
@@ -282,6 +429,27 @@ async def detect_boxes(project_id: str, page_id: str) -> dict[str, Any]:
     state = ProjectState(**read_state(target))
     state.boxes.append(box)
     return {"state": write_state(target, state)}
+
+
+@app.post("/api/projects/{project_id}/pages/{page_id}/auto-translate")
+async def auto_translate_page(project_id: str, page_id: str, request: AutoTranslateRequest) -> dict[str, Any]:
+    path = project_dir(project_id)
+    target = page_dir(path, page_id)
+    source_path = image_path(target)
+    image_bytes = source_path.read_bytes()
+    with Image.open(source_path) as source:
+        width, height = source.size
+
+    try:
+        content = await call_chat_completions(request, image_bytes, width, height, stream=False)
+    except HTTPException as exc:
+        if exc.status_code != 400 or "Stream must be set to true" not in str(exc.detail):
+            raise
+        content = await call_chat_completions(request, image_bytes, width, height, stream=True)
+
+    boxes = normalize_model_boxes(extract_json_object(content), width, height)
+    state = ProjectState(boxes=boxes)
+    return {"state": write_state(target, state), "raw": content}
 
 
 @app.get("/api/projects/{project_id}/pages/{page_id}/render.png")
