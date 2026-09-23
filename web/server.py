@@ -39,6 +39,13 @@ class ProjectState(BaseModel):
     boxes: list[Box] = Field(default_factory=list)
 
 
+class PageInfo(BaseModel):
+    id: str
+    filename: str
+    width: int
+    height: int
+
+
 def project_dir(project_id: str) -> Path:
     if not project_id or any(ch in project_id for ch in "/\\:."):
         raise HTTPException(400, detail="Invalid project id")
@@ -46,6 +53,32 @@ def project_dir(project_id: str) -> Path:
     if not path.exists():
         raise HTTPException(404, detail="Project not found")
     return path
+
+
+def page_dir(path: Path, page_id: str) -> Path:
+    if not page_id or any(ch in page_id for ch in "/\\:."):
+        raise HTTPException(400, detail="Invalid page id")
+    target = path / "pages" / page_id
+    if not target.exists():
+        raise HTTPException(404, detail="Page not found")
+    return target
+
+
+def manifest_path(path: Path) -> Path:
+    return path / "project.json"
+
+
+def read_manifest(path: Path) -> dict[str, Any]:
+    target = manifest_path(path)
+    if not target.exists():
+        return {"pages": []}
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def write_manifest(path: Path, pages: list[PageInfo]) -> dict[str, Any]:
+    payload = {"pages": [page.dict() for page in pages]}
+    manifest_path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
 
 
 def state_path(path: Path) -> Path:
@@ -107,7 +140,7 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, m
     return lines
 
 
-def render_project(path: Path) -> bytes:
+def render_page(path: Path) -> bytes:
     source = Image.open(image_path(path)).convert("RGB")
     state = ProjectState(**read_state(path))
     output = source.copy()
@@ -151,60 +184,92 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/api/projects")
-async def create_project(image: UploadFile = File(...)) -> dict[str, Any]:
+async def create_project(
+    images: list[UploadFile] | None = File(default=None),
+    image: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    uploads = list(images or [])
+    if image is not None:
+        uploads.append(image)
+    if not uploads:
+        raise HTTPException(400, detail="At least one image is required")
+
     project_id = secrets.token_hex(8)
     path = PROJECTS_DIR / project_id
     path.mkdir(parents=True, exist_ok=False)
+    pages_dir = path / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
 
-    raw = await image.read()
-    try:
-        pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(400, detail=f"Invalid image: {exc}") from exc
+    pages: list[PageInfo] = []
+    for index, upload in enumerate(uploads, start=1):
+        raw = await upload.read()
+        try:
+            pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as exc:
+            raise HTTPException(400, detail=f"Invalid image {upload.filename or index}: {exc}") from exc
 
-    source_path = path / "source.png"
-    pil_image.save(source_path, format="PNG")
-    write_state(path, ProjectState())
+        page_id = f"{index:04d}-{secrets.token_hex(4)}"
+        target = pages_dir / page_id
+        target.mkdir(parents=True, exist_ok=False)
+        pil_image.save(target / "source.png", format="PNG")
+        write_state(target, ProjectState())
+        pages.append(
+            PageInfo(
+                id=page_id,
+                filename=upload.filename or f"page-{index:04d}.png",
+                width=pil_image.width,
+                height=pil_image.height,
+            )
+        )
+
+    manifest = write_manifest(path, pages)
 
     return {
         "project_id": project_id,
-        "width": pil_image.width,
-        "height": pil_image.height,
-        "image_url": f"/api/projects/{project_id}/image",
-        "state": {"boxes": []},
+        "pages": [
+            {
+                **page,
+                "image_url": f"/api/projects/{project_id}/pages/{page['id']}/image",
+                "state": read_state(page_dir(path, page["id"])),
+            }
+            for page in manifest["pages"]
+        ],
     }
 
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str) -> dict[str, Any]:
     path = project_dir(project_id)
-    with Image.open(image_path(path)) as source:
-        width, height = source.size
     return {
         "project_id": project_id,
-        "width": width,
-        "height": height,
-        "image_url": f"/api/projects/{project_id}/image",
-        "state": read_state(path),
+        "pages": [
+            {
+                **page,
+                "image_url": f"/api/projects/{project_id}/pages/{page['id']}/image",
+                "state": read_state(page_dir(path, page["id"])),
+            }
+            for page in read_manifest(path)["pages"]
+        ],
     }
 
 
-@app.get("/api/projects/{project_id}/image")
-async def get_image(project_id: str) -> Response:
+@app.get("/api/projects/{project_id}/pages/{page_id}/image")
+async def get_image(project_id: str, page_id: str) -> Response:
     path = project_dir(project_id)
-    return Response(image_path(path).read_bytes(), media_type="image/png")
+    return Response(image_path(page_dir(path, page_id)).read_bytes(), media_type="image/png")
 
 
-@app.put("/api/projects/{project_id}/state")
-async def save_project_state(project_id: str, state: ProjectState) -> dict[str, Any]:
+@app.put("/api/projects/{project_id}/pages/{page_id}/state")
+async def save_project_state(project_id: str, page_id: str, state: ProjectState) -> dict[str, Any]:
     path = project_dir(project_id)
-    return {"state": write_state(path, state)}
+    return {"state": write_state(page_dir(path, page_id), state)}
 
 
-@app.post("/api/projects/{project_id}/boxes")
-async def detect_boxes(project_id: str) -> dict[str, Any]:
+@app.post("/api/projects/{project_id}/pages/{page_id}/boxes")
+async def detect_boxes(project_id: str, page_id: str) -> dict[str, Any]:
     path = project_dir(project_id)
-    with Image.open(image_path(path)) as source:
+    target = page_dir(path, page_id)
+    with Image.open(image_path(target)) as source:
         width, height = source.size
     box = Box(
         x=width * 0.25,
@@ -214,23 +279,28 @@ async def detect_boxes(project_id: str) -> dict[str, Any]:
         text="",
         translation="",
     )
-    state = ProjectState(**read_state(path))
+    state = ProjectState(**read_state(target))
     state.boxes.append(box)
-    return {"state": write_state(path, state)}
+    return {"state": write_state(target, state)}
 
 
-@app.get("/api/projects/{project_id}/render.png")
-async def render_png(project_id: str) -> Response:
-    return Response(render_project(project_dir(project_id)), media_type="image/png")
+@app.get("/api/projects/{project_id}/pages/{page_id}/render.png")
+async def render_png(project_id: str, page_id: str) -> Response:
+    return Response(render_page(page_dir(project_dir(project_id), page_id)), media_type="image/png")
 
 
 @app.get("/api/projects/{project_id}/download.zip")
 async def download_zip(project_id: str) -> StreamingResponse:
-    rendered = render_project(project_dir(project_id))
+    path = project_dir(project_id)
+    manifest = read_manifest(path)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("final.png", rendered)
-        archive.writestr("state.json", json.dumps(read_state(project_dir(project_id)), ensure_ascii=False, indent=2))
+        archive.writestr("project.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for index, page in enumerate(manifest["pages"], start=1):
+            target = page_dir(path, page["id"])
+            stem = f"{index:04d}-{Path(page['filename']).stem or page['id']}"
+            archive.writestr(f"final/{stem}.png", render_page(target))
+            archive.writestr(f"state/{stem}.json", json.dumps(read_state(target), ensure_ascii=False, indent=2))
     buf.seek(0)
     return StreamingResponse(
         buf,

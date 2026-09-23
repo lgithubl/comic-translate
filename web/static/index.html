@@ -82,11 +82,36 @@
       color: #64748b;
       min-height: 18px;
     }
-    .box-list {
+    .page-list, .box-list {
       display: grid;
       gap: 8px;
       overflow: auto;
       min-height: 0;
+    }
+    .page-list {
+      max-height: 180px;
+    }
+    .page-row {
+      border: 1px solid #d8dee5;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .page-row.active {
+      border-color: #0f766e;
+      background: #ecfdf5;
+    }
+    .page-row strong, .box-row strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .page-row div, .box-row div {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .box-row {
       border: 1px solid #d8dee5;
@@ -172,8 +197,8 @@
       </div>
 
       <label>
-        Image
-        <input id="upload" type="file" accept="image/png,image/jpeg,image/webp" />
+        Images
+        <input id="upload" type="file" accept="image/png,image/jpeg,image/webp" multiple />
       </label>
 
       <div class="actions">
@@ -194,6 +219,7 @@
       <button id="deleteBox" class="danger" disabled>Delete Selected</button>
 
       <div class="meta" id="projectMeta"></div>
+      <div class="page-list" id="pageList"></div>
       <div class="box-list" id="boxList"></div>
     </aside>
 
@@ -208,6 +234,8 @@
   <script>
     const state = {
       projectId: "",
+      pages: [],
+      currentPageId: "",
       imageWidth: 0,
       imageHeight: 0,
       boxes: [],
@@ -227,6 +255,7 @@
       translation: document.getElementById("translation"),
       message: document.getElementById("message"),
       projectMeta: document.getElementById("projectMeta"),
+      pageList: document.getElementById("pageList"),
       boxList: document.getElementById("boxList"),
       empty: document.getElementById("empty"),
       stage: document.getElementById("stage"),
@@ -239,6 +268,10 @@
 
     function selectedBox() {
       return state.boxes.find((box) => box.id === state.selectedId);
+    }
+
+    function currentPage() {
+      return state.pages.find((page) => page.id === state.currentPageId);
     }
 
     function imageScale() {
@@ -266,7 +299,10 @@
       if (!box) return;
       box.text = els.text.value;
       box.translation = els.translation.value;
+      const page = currentPage();
+      if (page) page.state = { boxes: state.boxes };
       renderBoxes();
+      renderPages();
     }
 
     function renderBoxes() {
@@ -295,6 +331,15 @@
       updateEditor();
     }
 
+    function renderPages() {
+      els.pageList.innerHTML = state.pages.map((page, index) => `
+        <div class="page-row ${page.id === state.currentPageId ? "active" : ""}" data-id="${page.id}">
+          <strong>${index + 1}. ${escapeHtml(page.filename)}</strong>
+          <div>${page.width} x ${page.height} | ${page.state?.boxes?.length || 0} boxes</div>
+        </div>
+      `).join("");
+    }
+
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (char) => ({
         "&": "&amp;",
@@ -308,6 +353,31 @@
     function selectBox(id) {
       state.selectedId = id || "";
       renderBoxes();
+    }
+
+    function loadPage(pageId) {
+      const page = state.pages.find((item) => item.id === pageId);
+      if (!page) return;
+      state.currentPageId = page.id;
+      state.imageWidth = page.width;
+      state.imageHeight = page.height;
+      state.boxes = page.state?.boxes || [];
+      state.selectedId = "";
+      els.image.src = `${page.image_url}?t=${Date.now()}`;
+      els.empty.classList.add("is-hidden");
+      els.stage.classList.remove("is-hidden");
+      els.projectMeta.textContent = `${state.pages.length} pages | ${state.projectId}`;
+      enableControls(true);
+      renderPages();
+      renderBoxes();
+      setMessage(`Page ${state.pages.findIndex((item) => item.id === page.id) + 1} loaded.`);
+    }
+
+    async function selectPage(pageId) {
+      if (state.currentPageId && pageId !== state.currentPageId) {
+        await saveState({ silent: true });
+      }
+      loadPage(pageId);
     }
 
     function addLocalBox() {
@@ -324,38 +394,38 @@
         translation: "",
       };
       state.boxes.push(box);
+      const page = currentPage();
+      if (page) page.state = { boxes: state.boxes };
       setMessage(`Box ${state.boxes.length} added. Drag it on the image, then type translation.`);
       selectBox(box.id);
+      renderPages();
     }
 
-    async function saveState() {
-      if (!state.projectId) return;
-      const response = await fetch(`/api/projects/${state.projectId}/state`, {
+    async function saveState(options = {}) {
+      if (!state.projectId || !state.currentPageId) return;
+      const page = currentPage();
+      if (page) page.state = { boxes: state.boxes };
+      const response = await fetch(`/api/projects/${state.projectId}/pages/${state.currentPageId}/state`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ boxes: state.boxes }),
       });
       if (!response.ok) throw new Error(await response.text());
-      setMessage("Saved.");
+      renderPages();
+      if (!options.silent) setMessage("Saved.");
     }
 
-    async function uploadImage(file) {
+    async function uploadImages(files) {
       const form = new FormData();
-      form.append("image", file);
+      for (const file of files) form.append("images", file);
       const response = await fetch("/api/projects", { method: "POST", body: form });
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
       state.projectId = data.project_id;
-      state.imageWidth = data.width;
-      state.imageHeight = data.height;
-      state.boxes = data.state.boxes || [];
-      state.selectedId = "";
-      els.image.src = `${data.image_url}?t=${Date.now()}`;
-      els.empty.classList.add("is-hidden");
-      els.stage.classList.remove("is-hidden");
-      els.projectMeta.textContent = `${data.width} x ${data.height} | ${data.project_id}`;
-      enableControls(true);
-      setMessage("Image loaded.");
+      state.pages = data.pages || [];
+      if (!state.pages.length) throw new Error("No pages returned by server");
+      loadPage(state.pages[0].id);
+      setMessage(`${state.pages.length} page(s) loaded.`);
     }
 
     function clampBox(box) {
@@ -366,11 +436,11 @@
     }
 
     els.upload.addEventListener("change", async () => {
-      const file = els.upload.files && els.upload.files[0];
-      if (!file) return;
+      const files = Array.from(els.upload.files || []);
+      if (!files.length) return;
       try {
-        setMessage("Uploading...");
-        await uploadImage(file);
+        setMessage(`Uploading ${files.length} page(s)...`);
+        await uploadImages(files);
       } catch (error) {
         setMessage(`Upload failed: ${error.message}`);
       } finally {
@@ -382,7 +452,7 @@
     els.saveState.addEventListener("click", () => saveState().catch((error) => setMessage(`Save failed: ${error.message}`)));
     els.render.addEventListener("click", async () => {
       await saveState();
-      window.open(`/api/projects/${state.projectId}/render.png?t=${Date.now()}`, "_blank", "noopener,noreferrer");
+      window.open(`/api/projects/${state.projectId}/pages/${state.currentPageId}/render.png?t=${Date.now()}`, "_blank", "noopener,noreferrer");
     });
     els.download.addEventListener("click", async () => {
       await saveState();
@@ -390,14 +460,21 @@
     });
     els.deleteBox.addEventListener("click", () => {
       state.boxes = state.boxes.filter((box) => box.id !== state.selectedId);
+      const page = currentPage();
+      if (page) page.state = { boxes: state.boxes };
       state.selectedId = "";
       renderBoxes();
+      renderPages();
     });
     els.text.addEventListener("input", syncSelectedText);
     els.translation.addEventListener("input", syncSelectedText);
     els.boxList.addEventListener("click", (event) => {
       const row = event.target.closest(".box-row");
       if (row) selectBox(row.dataset.id);
+    });
+    els.pageList.addEventListener("click", (event) => {
+      const row = event.target.closest(".page-row");
+      if (row) selectPage(row.dataset.id).catch((error) => setMessage(`Page switch failed: ${error.message}`));
     });
     els.image.addEventListener("load", renderBoxes);
     window.addEventListener("resize", renderBoxes);
