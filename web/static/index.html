@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Comic Translate Web</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #172026;
+      background: #f4f6f8;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    aside {
+      border-right: 1px solid #d8dee5;
+      background: #fff;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0 0 4px;
+      font-weight: 700;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 650;
+      color: #4b5563;
+    }
+    input, textarea, button {
+      font: inherit;
+    }
+    input[type="file"], textarea {
+      width: 100%;
+      border: 1px solid #cdd5df;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fff;
+    }
+    textarea {
+      min-height: 90px;
+      resize: vertical;
+    }
+    button {
+      border: 1px solid #263442;
+      background: #263442;
+      color: #fff;
+      border-radius: 6px;
+      padding: 8px 10px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button.secondary {
+      background: #fff;
+      color: #263442;
+    }
+    button.danger {
+      border-color: #b91c1c;
+      background: #b91c1c;
+    }
+    button:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .meta {
+      font-size: 12px;
+      color: #64748b;
+      min-height: 18px;
+    }
+    .box-list {
+      display: grid;
+      gap: 8px;
+      overflow: auto;
+      min-height: 0;
+    }
+    .box-row {
+      border: 1px solid #d8dee5;
+      border-radius: 6px;
+      padding: 8px;
+      background: #f8fafc;
+      cursor: pointer;
+    }
+    .box-row.active {
+      border-color: #2563eb;
+      background: #eff6ff;
+    }
+    main {
+      min-width: 0;
+      overflow: auto;
+      padding: 18px;
+    }
+    .stage {
+      position: relative;
+      display: inline-block;
+      background: #111827;
+      box-shadow: 0 10px 32px rgba(15, 23, 42, .22);
+      user-select: none;
+    }
+    .stage img {
+      display: block;
+      max-width: min(100%, 1200px);
+      height: auto;
+    }
+    .box {
+      position: absolute;
+      border: 2px solid #22c55e;
+      background: rgba(34, 197, 94, .13);
+      min-width: 24px;
+      min-height: 24px;
+      cursor: move;
+    }
+    .box.active {
+      border-color: #2563eb;
+      background: rgba(37, 99, 235, .12);
+    }
+    .handle {
+      position: absolute;
+      right: -6px;
+      bottom: -6px;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #fff;
+      background: #2563eb;
+      cursor: nwse-resize;
+    }
+    .box-label {
+      position: absolute;
+      left: 0;
+      top: -22px;
+      background: #111827;
+      color: white;
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .empty {
+      display: grid;
+      place-items: center;
+      min-height: calc(100vh - 36px);
+      color: #64748b;
+      border: 1px dashed #cbd5e1;
+      background: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div>
+        <h1>Comic Translate Web</h1>
+        <div class="meta" id="message">Upload an image to start.</div>
+      </div>
+
+      <label>
+        Image
+        <input id="upload" type="file" accept="image/png,image/jpeg,image/webp" />
+      </label>
+
+      <div class="actions">
+        <button id="addBox" disabled>Add Box</button>
+        <button id="saveState" class="secondary" disabled>Save</button>
+        <button id="render" class="secondary" disabled>Preview</button>
+        <button id="download" class="secondary" disabled>ZIP</button>
+      </div>
+
+      <label>
+        Text
+        <textarea id="text" disabled placeholder="OCR text or notes"></textarea>
+      </label>
+      <label>
+        Translation
+        <textarea id="translation" disabled placeholder="Rendered text"></textarea>
+      </label>
+      <button id="deleteBox" class="danger" disabled>Delete Selected</button>
+
+      <div class="meta" id="projectMeta"></div>
+      <div class="box-list" id="boxList"></div>
+    </aside>
+
+    <main>
+      <div class="empty" id="empty">No image loaded</div>
+      <div class="stage" id="stage" hidden>
+        <img id="image" alt="uploaded comic page" />
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      projectId: "",
+      imageWidth: 0,
+      imageHeight: 0,
+      boxes: [],
+      selectedId: "",
+      scale: 1,
+      drag: null,
+    };
+
+    const els = {
+      upload: document.getElementById("upload"),
+      addBox: document.getElementById("addBox"),
+      saveState: document.getElementById("saveState"),
+      render: document.getElementById("render"),
+      download: document.getElementById("download"),
+      deleteBox: document.getElementById("deleteBox"),
+      text: document.getElementById("text"),
+      translation: document.getElementById("translation"),
+      message: document.getElementById("message"),
+      projectMeta: document.getElementById("projectMeta"),
+      boxList: document.getElementById("boxList"),
+      empty: document.getElementById("empty"),
+      stage: document.getElementById("stage"),
+      image: document.getElementById("image"),
+    };
+
+    function setMessage(value) {
+      els.message.textContent = value;
+    }
+
+    function selectedBox() {
+      return state.boxes.find((box) => box.id === state.selectedId);
+    }
+
+    function imageScale() {
+      if (!state.imageWidth) return 1;
+      return els.image.clientWidth / state.imageWidth;
+    }
+
+    function enableControls(enabled) {
+      for (const el of [els.addBox, els.saveState, els.render, els.download]) el.disabled = !enabled;
+      updateEditor();
+    }
+
+    function updateEditor() {
+      const box = selectedBox();
+      const enabled = Boolean(box);
+      els.text.disabled = !enabled;
+      els.translation.disabled = !enabled;
+      els.deleteBox.disabled = !enabled;
+      els.text.value = box ? box.text || "" : "";
+      els.translation.value = box ? box.translation || "" : "";
+    }
+
+    function syncSelectedText() {
+      const box = selectedBox();
+      if (!box) return;
+      box.text = els.text.value;
+      box.translation = els.translation.value;
+      renderBoxes();
+    }
+
+    function renderBoxes() {
+      for (const node of Array.from(els.stage.querySelectorAll(".box"))) node.remove();
+      const scale = imageScale();
+      state.scale = scale;
+
+      state.boxes.forEach((box, index) => {
+        const node = document.createElement("div");
+        node.className = `box${box.id === state.selectedId ? " active" : ""}`;
+        node.style.left = `${box.x * scale}px`;
+        node.style.top = `${box.y * scale}px`;
+        node.style.width = `${box.width * scale}px`;
+        node.style.height = `${box.height * scale}px`;
+        node.dataset.id = box.id;
+        node.innerHTML = `<div class="box-label">${index + 1}</div><div class="handle"></div>`;
+        els.stage.appendChild(node);
+      });
+
+      els.boxList.innerHTML = state.boxes.map((box, index) => `
+        <div class="box-row ${box.id === state.selectedId ? "active" : ""}" data-id="${box.id}">
+          <strong>Box ${index + 1}</strong>
+          <div>${escapeHtml((box.translation || box.text || "empty").slice(0, 64))}</div>
+        </div>
+      `).join("");
+      updateEditor();
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      }[char]));
+    }
+
+    function selectBox(id) {
+      state.selectedId = id || "";
+      renderBoxes();
+    }
+
+    function addLocalBox() {
+      const width = Math.max(120, state.imageWidth * 0.28);
+      const height = Math.max(80, state.imageHeight * 0.12);
+      const box = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+        x: Math.max(0, (state.imageWidth - width) / 2),
+        y: Math.max(0, (state.imageHeight - height) / 2),
+        width,
+        height,
+        rotation: 0,
+        text: "",
+        translation: "",
+      };
+      state.boxes.push(box);
+      selectBox(box.id);
+    }
+
+    async function saveState() {
+      if (!state.projectId) return;
+      const response = await fetch(`/api/projects/${state.projectId}/state`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ boxes: state.boxes }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setMessage("Saved.");
+    }
+
+    async function uploadImage(file) {
+      const form = new FormData();
+      form.append("image", file);
+      const response = await fetch("/api/projects", { method: "POST", body: form });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      state.projectId = data.project_id;
+      state.imageWidth = data.width;
+      state.imageHeight = data.height;
+      state.boxes = data.state.boxes || [];
+      state.selectedId = "";
+      els.image.src = `${data.image_url}?t=${Date.now()}`;
+      els.empty.hidden = true;
+      els.stage.hidden = false;
+      els.projectMeta.textContent = `${data.width} x ${data.height} | ${data.project_id}`;
+      enableControls(true);
+      setMessage("Image loaded.");
+    }
+
+    function clampBox(box) {
+      box.width = Math.max(24, Math.min(box.width, state.imageWidth - box.x));
+      box.height = Math.max(24, Math.min(box.height, state.imageHeight - box.y));
+      box.x = Math.max(0, Math.min(box.x, state.imageWidth - box.width));
+      box.y = Math.max(0, Math.min(box.y, state.imageHeight - box.height));
+    }
+
+    els.upload.addEventListener("change", async () => {
+      const file = els.upload.files && els.upload.files[0];
+      if (!file) return;
+      try {
+        setMessage("Uploading...");
+        await uploadImage(file);
+      } catch (error) {
+        setMessage(`Upload failed: ${error.message}`);
+      } finally {
+        els.upload.value = "";
+      }
+    });
+
+    els.addBox.addEventListener("click", addLocalBox);
+    els.saveState.addEventListener("click", () => saveState().catch((error) => setMessage(`Save failed: ${error.message}`)));
+    els.render.addEventListener("click", async () => {
+      await saveState();
+      window.open(`/api/projects/${state.projectId}/render.png?t=${Date.now()}`, "_blank", "noopener,noreferrer");
+    });
+    els.download.addEventListener("click", async () => {
+      await saveState();
+      window.location.href = `/api/projects/${state.projectId}/download.zip`;
+    });
+    els.deleteBox.addEventListener("click", () => {
+      state.boxes = state.boxes.filter((box) => box.id !== state.selectedId);
+      state.selectedId = "";
+      renderBoxes();
+    });
+    els.text.addEventListener("input", syncSelectedText);
+    els.translation.addEventListener("input", syncSelectedText);
+    els.boxList.addEventListener("click", (event) => {
+      const row = event.target.closest(".box-row");
+      if (row) selectBox(row.dataset.id);
+    });
+    els.image.addEventListener("load", renderBoxes);
+    window.addEventListener("resize", renderBoxes);
+
+    els.stage.addEventListener("pointerdown", (event) => {
+      const boxNode = event.target.closest(".box");
+      if (!boxNode) return;
+      const box = state.boxes.find((item) => item.id === boxNode.dataset.id);
+      if (!box) return;
+      selectBox(box.id);
+      const rect = els.stage.getBoundingClientRect();
+      const scale = imageScale();
+      state.drag = {
+        id: box.id,
+        mode: event.target.classList.contains("handle") ? "resize" : "move",
+        startX: (event.clientX - rect.left) / scale,
+        startY: (event.clientY - rect.top) / scale,
+        box: { ...box },
+      };
+      boxNode.setPointerCapture(event.pointerId);
+    });
+
+    els.stage.addEventListener("pointermove", (event) => {
+      if (!state.drag) return;
+      const box = state.boxes.find((item) => item.id === state.drag.id);
+      if (!box) return;
+      const rect = els.stage.getBoundingClientRect();
+      const scale = imageScale();
+      const x = (event.clientX - rect.left) / scale;
+      const y = (event.clientY - rect.top) / scale;
+      const dx = x - state.drag.startX;
+      const dy = y - state.drag.startY;
+      if (state.drag.mode === "move") {
+        box.x = state.drag.box.x + dx;
+        box.y = state.drag.box.y + dy;
+      } else {
+        box.width = state.drag.box.width + dx;
+        box.height = state.drag.box.height + dy;
+      }
+      clampBox(box);
+      renderBoxes();
+    });
+
+    window.addEventListener("pointerup", () => {
+      state.drag = null;
+    });
+  </script>
+</body>
+</html>

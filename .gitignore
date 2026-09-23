@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.ct-web-data/
+.venv-web/
+
 # Settings File
 **/settings.json
 /app/icons

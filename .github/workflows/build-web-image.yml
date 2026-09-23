@@ -1,0 +1,70 @@
+name: Build Web Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag
+        required: false
+        default: web
+      export_artifact:
+        description: Export image tar.gz artifact
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-web-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image name
+        id: image
+        shell: bash
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/comic-translate:${{ inputs.tag }}"
+          echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+
+      - name: Export image tarball
+        if: inputs.export_artifact == 'true'
+        shell: bash
+        run: |
+          docker pull "${{ steps.image.outputs.image }}"
+          docker save "${{ steps.image.outputs.image }}" | gzip > comic-translate-web-${{ inputs.tag }}.tar.gz
+
+      - name: Upload image artifact
+        if: inputs.export_artifact == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: comic-translate-web-${{ inputs.tag }}
+          path: comic-translate-web-${{ inputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
